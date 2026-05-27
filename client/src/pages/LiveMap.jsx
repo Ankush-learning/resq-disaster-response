@@ -1,67 +1,73 @@
-import { useState, useEffect } from 'react'
+import { useState, useEffect, useRef, useCallback } from 'react'
 import { motion, AnimatePresence } from 'framer-motion'
-import { MapPin, AlertTriangle, X, Clock, Layers, RefreshCw, Wifi, WifiOff, ExternalLink } from 'lucide-react'
-
-const geoToSvg = (lat, lng) => ({
-  x: ((lng + 180) / 360) * 1000,
-  y: ((90 - lat) / 180) * 500,
-})
+import { Link } from 'react-router-dom'
+import { MapPin, AlertTriangle, X, Clock, Layers, RefreshCw, Wifi, WifiOff, ExternalLink, ZoomIn, ZoomOut } from 'lucide-react'
+import * as d3 from 'd3'
+import * as topojson from 'topojson-client'
 
 const severityColor = { critical:'#ef4444', high:'#f97316', medium:'#eab308', low:'#22c55e' }
-
 const magToSeverity = (m) => m >= 6.5 ? 'critical' : m >= 5.5 ? 'high' : m >= 4.5 ? 'medium' : 'low'
 
 const shelters = [
-  { id:'SH-01', lat:28.6, lng:77.2, name:'Delhi Relief Camp', capacity:500, filled:340 },
-  { id:'SH-02', lat:19.0, lng:72.8, name:'Mumbai Aid Hub', capacity:800, filled:420 },
-  { id:'SH-03', lat:22.6, lng:88.4, name:'Kolkata Shelter', capacity:300, filled:120 },
-  { id:'SH-04', lat:35.7, lng:139.7, name:'Tokyo Emergency Centre', capacity:2000, filled:850 },
-  { id:'SH-05', lat:1.3, lng:103.8, name:'Singapore Aid Centre', capacity:1000, filled:200 },
+  { id:'SH-01', lat:28.6, lng:77.2,   name:'Delhi Relief Camp',       capacity:500,  filled:340 },
+  { id:'SH-02', lat:19.0, lng:72.8,   name:'Mumbai Aid Hub',           capacity:800,  filled:420 },
+  { id:'SH-03', lat:22.6, lng:88.4,   name:'Kolkata Shelter',          capacity:300,  filled:120 },
+  { id:'SH-04', lat:35.7, lng:139.7,  name:'Tokyo Emergency Centre',   capacity:2000, filled:850 },
+  { id:'SH-05', lat:1.3,  lng:103.8,  name:'Singapore Aid Centre',     capacity:1000, filled:200 },
 ]
 
-const continentPaths = [
-  { d:'M 95 95 L 130 75 L 185 80 L 215 105 L 220 145 L 200 180 L 165 195 L 150 215 L 135 225 L 120 215 L 108 195 L 98 172 L 83 148 L 88 120 Z' },
-  { d:'M 150 215 L 165 195 L 178 215 L 172 238 L 156 242 Z' },
-  { d:'M 188 248 L 222 238 L 258 252 L 272 295 L 263 355 L 238 388 L 212 372 L 192 332 L 178 292 L 180 268 Z' },
-  { d:'M 428 68 L 482 58 L 522 76 L 512 102 L 492 118 L 460 112 L 444 96 Z' },
-  { d:'M 438 152 L 492 142 L 542 158 L 548 212 L 532 272 L 512 322 L 492 342 L 462 328 L 440 278 L 428 222 L 428 182 Z' },
-  { d:'M 512 55 L 625 45 L 752 52 L 822 68 L 802 102 L 742 112 L 682 108 L 622 118 L 565 112 L 530 92 Z' },
-  { d:'M 518 132 L 572 122 L 602 142 L 592 172 L 558 182 L 520 168 Z' },
-  { d:'M 602 152 L 662 142 L 702 162 L 712 202 L 682 232 L 642 238 L 612 212 L 596 188 Z' },
-  { d:'M 712 178 L 762 162 L 802 172 L 822 202 L 802 228 L 762 232 L 720 212 Z' },
-  { d:'M 732 298 L 802 288 L 852 302 L 862 348 L 842 378 L 792 388 L 742 368 L 718 338 L 722 312 Z' },
-  { d:'M 820 112 L 836 102 L 849 112 L 841 132 L 822 130 Z' },
-  { d:'M 433 72 L 448 65 L 456 78 L 446 90 L 434 86 Z' },
-]
+function getTimeAgo(ts) {
+  const mins = Math.floor((Date.now() - ts) / 60000)
+  if (mins < 60) return `${mins}m ago`
+  const hrs = Math.floor(mins / 60)
+  if (hrs < 24) return `${hrs}h ago`
+  return `${Math.floor(hrs / 24)}d ago`
+}
 
 export default function LiveMap() {
-  const [quakes, setQuakes] = useState([])
-  const [loading, setLoading] = useState(true)
-  const [lastFetch, setLastFetch] = useState(null)
-  const [selected, setSelected] = useState(null)
-  const [hovered, setHovered] = useState(null)
-  const [filterSev, setFilterSev] = useState('all')
-  const [layers, setLayers] = useState({ earthquakes:true, shelters:true })
-  const [online, setOnline] = useState(true)
+  const svgRef    = useRef(null)
+  const gRef      = useRef(null)   // group for zoom
+  const projRef   = useRef(null)
+  const zoomRef   = useRef(null)
 
-  const fetchData = async () => {
+  const [quakes,    setQuakes]    = useState([])
+  const [world,     setWorld]     = useState(null)
+  const [loading,   setLoading]   = useState(true)
+  const [lastFetch, setLastFetch] = useState(null)
+  const [selected,  setSelected]  = useState(null)
+  const [hovered,   setHovered]   = useState(null)
+  const [tooltip,   setTooltip]   = useState({ visible:false, x:0, y:0, q:null })
+  const [filterSev, setFilterSev] = useState('all')
+  const [layers,    setLayers]    = useState({ earthquakes:true, shelters:true })
+  const [online,    setOnline]    = useState(true)
+  const [zoomLevel, setZoomLevel] = useState(1)
+
+  // ── Fetch TopoJSON world atlas ─────────────────────────────────────────
+  useEffect(() => {
+    fetch('https://cdn.jsdelivr.net/npm/world-atlas@2/countries-110m.json')
+      .then(r => r.json())
+      .then(topo => setWorld(topo))
+      .catch(() => console.error('Failed to load world atlas'))
+  }, [])
+
+  // ── Fetch USGS earthquakes ─────────────────────────────────────────────
+  const fetchQuakes = useCallback(async () => {
     setLoading(true)
     try {
-      const res = await fetch('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_week.geojson')
+      const res  = await fetch('https://earthquake.usgs.gov/earthquakes/feed/v1.0/summary/4.5_week.geojson')
       const data = await res.json()
-      const formatted = data.features.slice(0, 50).map(f => ({
-        id: f.id,
+      const formatted = data.features.slice(0, 60).map(f => ({
+        id:        f.id,
         magnitude: Math.round(f.properties.mag * 10) / 10,
-        severity: magToSeverity(f.properties.mag),
-        location: f.properties.place,
-        lat: f.geometry.coordinates[1],
-        lng: f.geometry.coordinates[0],
-        depth: Math.round(f.geometry.coordinates[2]),
-        time: new Date(f.properties.time).toLocaleString(),
-        timeAgo: getTimeAgo(f.properties.time),
-        url: f.properties.url,
-        felt: f.properties.felt,
-        status: 'active',
+        severity:  magToSeverity(f.properties.mag),
+        location:  f.properties.place,
+        lat:       f.geometry.coordinates[1],
+        lng:       f.geometry.coordinates[0],
+        depth:     Math.round(f.geometry.coordinates[2]),
+        time:      new Date(f.properties.time).toLocaleString(),
+        timeAgo:   getTimeAgo(f.properties.time),
+        url:       f.properties.url,
+        felt:      f.properties.felt,
       }))
       setQuakes(formatted)
       setLastFetch(new Date())
@@ -71,27 +77,179 @@ export default function LiveMap() {
     } finally {
       setLoading(false)
     }
-  }
-
-  const getTimeAgo = (ts) => {
-    const mins = Math.floor((Date.now() - ts) / 60000)
-    if (mins < 60) return `${mins}m ago`
-    const hrs = Math.floor(mins / 60)
-    if (hrs < 24) return `${hrs}h ago`
-    return `${Math.floor(hrs / 24)}d ago`
-  }
+  }, [])
 
   useEffect(() => {
-    fetchData()
-    const interval = setInterval(fetchData, 5 * 60 * 1000)
-    return () => clearInterval(interval)
-  }, [])
+    fetchQuakes()
+    const iv = setInterval(fetchQuakes, 5 * 60 * 1000)
+    return () => clearInterval(iv)
+  }, [fetchQuakes])
+
+  // ── Build D3 map ───────────────────────────────────────────────────────
+  useEffect(() => {
+    if (!world || !svgRef.current) return
+
+    const el    = svgRef.current
+    const W     = el.clientWidth  || 900
+    const H     = el.clientHeight || 500
+
+    const svg = d3.select(el)
+    svg.selectAll('*').remove()
+
+    // Ocean background
+    svg.append('rect').attr('width', W).attr('height', H).attr('fill', '#071428')
+
+    const projection = d3.geoNaturalEarth1()
+      .scale(W / 6.1)
+      .translate([W / 2, H / 2])
+    projRef.current = projection
+
+    const path = d3.geoPath().projection(projection)
+    const g    = svg.append('g')
+    gRef.current = g
+
+    // Graticule
+    const graticule = d3.geoGraticule()()
+    g.append('path')
+      .datum(graticule)
+      .attr('d', path)
+      .attr('fill', 'none')
+      .attr('stroke', 'rgba(34,211,238,0.06)')
+      .attr('stroke-width', 0.5)
+
+    // Countries
+    const countries = topojson.feature(world, world.objects.countries)
+    g.append('g')
+      .selectAll('path')
+      .data(countries.features)
+      .join('path')
+      .attr('d', path)
+      .attr('fill', '#1a3a5c')
+      .attr('stroke', 'rgba(34,211,238,0.22)')
+      .attr('stroke-width', 0.5)
+      .attr('stroke-linejoin', 'round')
+
+    // Country borders
+    g.append('path')
+      .datum(topojson.mesh(world, world.objects.countries, (a, b) => a !== b))
+      .attr('d', path)
+      .attr('fill', 'none')
+      .attr('stroke', 'rgba(34,211,238,0.1)')
+      .attr('stroke-width', 0.3)
+
+    // Zoom behaviour
+    const zoom = d3.zoom()
+      .scaleExtent([1, 10])
+      .on('zoom', (event) => {
+        g.attr('transform', event.transform)
+        setZoomLevel(Math.round(event.transform.k * 10) / 10)
+      })
+    zoomRef.current = zoom
+    svg.call(zoom)
+
+  }, [world])
+
+  // ── Overlay earthquake dots & shelters (re-runs on data / filter change) ─
+  useEffect(() => {
+    if (!gRef.current || !projRef.current) return
+
+    const g    = gRef.current
+    const proj = projRef.current
+
+    // Remove previous overlays
+    g.selectAll('.eq-layer').remove()
+    g.selectAll('.shelter-layer').remove()
+
+    const filtered = quakes.filter(q => filterSev === 'all' || q.severity === filterSev)
+
+    // ── Earthquakes ────────────────────────────────────────────────────
+    if (layers.earthquakes) {
+      const eqG = g.append('g').attr('class', 'eq-layer')
+
+      filtered.forEach(q => {
+        const [px, py] = proj([q.lng, q.lat])
+        const color  = severityColor[q.severity]
+        const r      = q.severity === 'critical' ? 8 : q.severity === 'high' ? 6 : 5
+
+        const dot = eqG.append('g')
+          .attr('transform', `translate(${px},${py})`)
+          .style('cursor', 'pointer')
+
+        // Pulse ring for critical/high
+        if (q.severity === 'critical' || q.severity === 'high') {
+          const pulse = dot.append('circle')
+            .attr('r', r)
+            .attr('fill', 'none')
+            .attr('stroke', color)
+            .attr('stroke-width', 1.5)
+            .attr('opacity', 0.6)
+
+          pulse.append('animate')
+            .attr('attributeName', 'r')
+            .attr('from', r).attr('to', r * 4)
+            .attr('dur', '2.5s').attr('repeatCount', 'indefinite')
+
+          pulse.append('animate')
+            .attr('attributeName', 'opacity')
+            .attr('from', 0.6).attr('to', 0)
+            .attr('dur', '2.5s').attr('repeatCount', 'indefinite')
+        }
+
+        // Main dot
+        dot.append('circle')
+          .attr('r', r)
+          .attr('fill', color)
+          .attr('fill-opacity', 0.9)
+          .attr('stroke', 'rgba(255,255,255,0.3)')
+          .attr('stroke-width', 0.8)
+
+        // Inner highlight
+        dot.append('circle')
+          .attr('r', r * 0.35)
+          .attr('fill', 'white')
+          .attr('opacity', 0.5)
+
+        dot
+          .on('mouseenter', function(event) {
+            d3.select(this).select('circle').attr('r', r + 3)
+            const svgRect = svgRef.current.getBoundingClientRect()
+            setTooltip({ visible:true, x: event.clientX - svgRect.left, y: event.clientY - svgRect.top, q })
+            setHovered(q.id)
+          })
+          .on('mouseleave', function() {
+            d3.select(this).select('circle').attr('r', r)
+            setTooltip(t => ({ ...t, visible:false }))
+            setHovered(null)
+          })
+          .on('click', () => setSelected(prev => prev?.id === q.id ? null : q))
+      })
+    }
+
+    // ── Shelters ───────────────────────────────────────────────────────
+    if (layers.shelters) {
+      const shG = g.append('g').attr('class', 'shelter-layer')
+
+      shelters.forEach(s => {
+        const [px, py] = proj([s.lng, s.lat])
+        const sh = shG.append('g').attr('transform', `translate(${px},${py})`).style('cursor','pointer')
+
+        sh.append('circle').attr('r', 9).attr('fill', 'rgba(34,197,94,0.15)').attr('stroke', '#22c55e').attr('stroke-width', 1.5)
+        sh.append('text').attr('text-anchor','middle').attr('dominant-baseline','middle').attr('font-size', 10).attr('fill', '#22c55e').attr('font-weight','bold').text('+')
+      })
+    }
+
+  }, [quakes, world, filterSev, layers])
 
   const filtered = quakes.filter(q => filterSev === 'all' || q.severity === filterSev)
 
+  const zoomIn  = () => { if (svgRef.current && zoomRef.current) d3.select(svgRef.current).transition().call(zoomRef.current.scaleBy, 1.6) }
+  const zoomOut = () => { if (svgRef.current && zoomRef.current) d3.select(svgRef.current).transition().call(zoomRef.current.scaleBy, 0.625) }
+  const resetZoom = () => { if (svgRef.current && zoomRef.current) d3.select(svgRef.current).transition().call(zoomRef.current.transform, d3.zoomIdentity) }
+
   return (
     <div className="min-h-screen pt-16 flex flex-col" style={{ background:'#020817' }}>
-      {/* Top bar */}
+
+      {/* ── Top bar ─────────────────────────────────────────────────── */}
       <div className="flex items-center justify-between px-6 py-3 border-b border-white/5 glass">
         <div className="flex items-center gap-3">
           <div className="section-tag !mb-0">
@@ -100,13 +258,14 @@ export default function LiveMap() {
             LIVE MAP
           </div>
           <span className="font-mono text-xs text-slate-500 hidden sm:block">
-            {loading ? 'Fetching USGS data...' : `${filtered.length} real earthquakes · USGS live feed`}
+            {loading ? 'Fetching USGS data…' : `${filtered.length} earthquakes · USGS live feed`}
           </span>
           <span className={`flex items-center gap-1 font-mono text-xs ${online ? 'text-green-400' : 'text-red-400'}`}>
             {online ? <Wifi size={10}/> : <WifiOff size={10}/>}
             {online ? 'Live' : 'Offline'}
           </span>
         </div>
+
         <div className="flex items-center gap-2">
           <div className="hidden md:flex items-center gap-1 p-1 glass rounded-xl">
             {['all','critical','high','medium','low'].map(s => (
@@ -115,7 +274,7 @@ export default function LiveMap() {
               >{s}</button>
             ))}
           </div>
-          <motion.button whileTap={{ rotate:180 }} transition={{ duration:0.4 }} onClick={fetchData}
+          <motion.button whileTap={{ rotate:180 }} transition={{ duration:0.4 }} onClick={fetchQuakes}
             className="w-9 h-9 glass rounded-xl flex items-center justify-center text-slate-400 hover:text-white"
           >
             <RefreshCw size={14} className={loading ? 'animate-spin' : ''}/>
@@ -123,112 +282,59 @@ export default function LiveMap() {
         </div>
       </div>
 
-      <div className="flex flex-1 overflow-hidden">
-        {/* Map */}
-        <div className="flex-1 relative overflow-hidden">
-          <div className="absolute inset-0 opacity-[0.04]"
-            style={{ backgroundImage:'linear-gradient(rgba(34,211,238,1) 1px,transparent 1px),linear-gradient(90deg,rgba(34,211,238,1) 1px,transparent 1px)', backgroundSize:'50px 50px' }}/>
+      <div className="flex flex-1 overflow-hidden" style={{ minHeight: 0 }}>
 
-          {loading && (
-            <div className="absolute inset-0 flex items-center justify-center z-20">
+        {/* ── Map canvas ─────────────────────────────────────────────── */}
+        <div className="flex-1 relative overflow-hidden">
+
+          {/* Loading overlay */}
+          {(!world || loading) && (
+            <div className="absolute inset-0 flex items-center justify-center z-20 pointer-events-none">
               <div className="glass rounded-2xl px-8 py-5 flex items-center gap-4">
                 <RefreshCw size={18} className="animate-spin text-cyan-400"/>
-                <span className="font-mono text-sm text-cyan-400">Fetching live earthquake data from USGS...</span>
+                <span className="font-mono text-sm text-cyan-400">
+                  {!world ? 'Loading world map…' : 'Fetching live earthquake data…'}
+                </span>
               </div>
             </div>
           )}
 
-          <svg viewBox="0 0 1000 500" className="w-full h-full"
-            style={{ background:'radial-gradient(ellipse at 50% 40%, #071428 0%, #020817 100%)' }}
-          >
-            {/* Grid */}
-            {[-60,-30,0,30,60].map(lat => {
-              const y = ((90-lat)/180)*500
-              return <line key={lat} x1="0" y1={y} x2="1000" y2={y} stroke="rgba(34,211,238,0.05)" strokeWidth="0.5"/>
-            })}
-            {[-120,-60,0,60,120].map(lng => {
-              const x = ((lng+180)/360)*1000
-              return <line key={lng} x1={x} y1="0" x2={x} y2="500" stroke="rgba(34,211,238,0.05)" strokeWidth="0.5"/>
-            })}
+          {/* D3 SVG */}
+          <svg ref={svgRef} className="w-full h-full" style={{ display:'block' }}/>
 
-            {/* Continents */}
-            {continentPaths.map((p,i) => (
-              <path key={i} d={p.d} fill="#1a3a5c" stroke="rgba(34,211,238,0.2)" strokeWidth="0.8"/>
-            ))}
-
-            {/* Tectonic plate hints */}
-            <path d="M 800 80 Q 840 150 820 240 Q 800 300 780 250" fill="none" stroke="rgba(249,115,22,0.1)" strokeWidth="2" strokeDasharray="8,5"/>
-            <path d="M 550 70 Q 680 85 740 160 Q 710 210 650 190" fill="none" stroke="rgba(249,115,22,0.1)" strokeWidth="2" strokeDasharray="8,5"/>
-
-            {/* Shelters */}
-            {layers.shelters && shelters.map(s => {
-              const pos = geoToSvg(s.lat, s.lng)
-              return (
-                <g key={s.id} title={s.name}>
-                  <circle cx={pos.x} cy={pos.y} r="7" fill="rgba(34,197,94,0.2)" stroke="#22c55e" strokeWidth="1.5"/>
-                  <text x={pos.x} y={pos.y+1} textAnchor="middle" dominantBaseline="middle" fontSize="8" fill="#22c55e" fontWeight="bold">+</text>
-                </g>
-              )
-            })}
-
-            {/* Earthquake dots */}
-            {layers.earthquakes && filtered.map(q => {
-              const pos = geoToSvg(q.lat, q.lng)
-              const color = severityColor[q.severity]
-              const r = q.severity === 'critical' ? 7 : q.severity === 'high' ? 6 : 5
-              const isSelected = selected?.id === q.id
-
-              return (
-                <g key={q.id} style={{ cursor:'pointer' }}
-                  onClick={() => setSelected(q.id === selected?.id ? null : q)}
-                  onMouseEnter={() => setHovered(q.id)}
-                  onMouseLeave={() => setHovered(null)}
-                >
-                  {(q.severity === 'critical' || q.severity === 'high') && (
-                    <circle cx={pos.x} cy={pos.y} r={r} fill="none" stroke={color} strokeWidth="1" opacity="0.4">
-                      <animate attributeName="r" from={r} to={r*3.5} dur="2s" repeatCount="indefinite"/>
-                      <animate attributeName="opacity" from="0.4" to="0" dur="2s" repeatCount="indefinite"/>
-                    </circle>
-                  )}
-                  <circle cx={pos.x} cy={pos.y}
-                    r={isSelected || hovered === q.id ? r+2.5 : r}
-                    fill={color} opacity={0.9}
-                    style={{ transition:'r 0.2s' }}
-                  />
-                  <circle cx={pos.x} cy={pos.y} r="2" fill="white" opacity="0.6"/>
-                  {isSelected && (
-                    <circle cx={pos.x} cy={pos.y} r={r+6} fill="none" stroke={color} strokeWidth="2" opacity="0.5"/>
-                  )}
-                </g>
-              )
-            })}
-          </svg>
-
-          {/* Hover tooltip */}
+          {/* Tooltip */}
           <AnimatePresence>
-            {hovered && (() => {
-              const q = quakes.find(i => i.id === hovered)
-              return q ? (
-                <motion.div initial={{ opacity:0, scale:0.9 }} animate={{ opacity:1, scale:1 }} exit={{ opacity:0 }}
-                  className="absolute top-4 left-4 glass rounded-xl p-3 pointer-events-none z-10"
-                >
-                  <p className="font-display font-bold text-sm text-white">M{q.magnitude} Earthquake</p>
-                  <p className="font-mono text-xs text-slate-400 mt-0.5">{q.location}</p>
-                  <p className="font-mono text-xs text-slate-600">Depth: {q.depth}km · {q.timeAgo}</p>
-                </motion.div>
-              ) : null
-            })()}
+            {tooltip.visible && tooltip.q && (
+              <motion.div
+                initial={{ opacity:0, scale:0.9 }} animate={{ opacity:1, scale:1 }} exit={{ opacity:0 }}
+                className="absolute glass rounded-xl p-3 pointer-events-none z-30 max-w-[220px]"
+                style={{ left: tooltip.x + 12, top: tooltip.y - 10 }}
+              >
+                <p className="font-bold text-sm text-white">M{tooltip.q.magnitude} Earthquake</p>
+                <p className="font-mono text-xs text-slate-400 mt-0.5 leading-snug">{tooltip.q.location}</p>
+                <p className="font-mono text-xs text-slate-600 mt-1">Depth {tooltip.q.depth}km · {tooltip.q.timeAgo}</p>
+              </motion.div>
+            )}
           </AnimatePresence>
 
           {/* Data source badge */}
-          <div className="absolute top-4 right-4 glass rounded-xl px-3 py-2 flex items-center gap-2">
+          <div className="absolute top-4 right-4 glass rounded-xl px-3 py-2 flex items-center gap-2 z-10">
             <div className="w-2 h-2 rounded-full bg-green-400 animate-pulse"/>
             <span className="font-mono text-xs text-slate-400">USGS Real-time Feed</span>
             {lastFetch && <span className="font-mono text-xs text-slate-600">· {lastFetch.toLocaleTimeString()}</span>}
           </div>
 
-          {/* Layer controls */}
-          <div className="absolute bottom-4 left-4 glass rounded-xl p-4">
+          {/* Zoom controls */}
+          <div className="absolute top-4 left-4 flex flex-col gap-1 z-10">
+            <button onClick={zoomIn}  className="w-9 h-9 glass rounded-xl flex items-center justify-center text-slate-400 hover:text-cyan-400 transition-colors"><ZoomIn  size={14}/></button>
+            <button onClick={zoomOut} className="w-9 h-9 glass rounded-xl flex items-center justify-center text-slate-400 hover:text-cyan-400 transition-colors"><ZoomOut size={14}/></button>
+            {zoomLevel > 1.05 && (
+              <button onClick={resetZoom} className="glass rounded-xl px-2 py-1 font-mono text-[10px] text-slate-500 hover:text-slate-300 transition-colors">Reset</button>
+            )}
+          </div>
+
+          {/* Legend + layer controls */}
+          <div className="absolute bottom-4 left-4 glass rounded-xl p-4 z-10">
             <p className="font-mono text-[10px] text-slate-500 uppercase tracking-wider mb-2 flex items-center gap-2">
               <Layers size={10}/> Layers
             </p>
@@ -253,34 +359,37 @@ export default function LiveMap() {
           </div>
         </div>
 
-        {/* Sidebar */}
-        <div className="w-80 border-l border-white/5 hidden lg:flex flex-col">
+        {/* ── Sidebar ────────────────────────────────────────────────── */}
+        <div className="w-80 border-l border-white/5 hidden lg:flex flex-col overflow-hidden">
           <div className="flex-1 overflow-y-auto p-4 space-y-2">
-            <h3 className="font-display font-bold text-sm text-white mb-4 flex items-center gap-2">
+            <h3 className="font-bold text-sm text-white mb-4 flex items-center gap-2">
               <AlertTriangle size={14} className="text-red-400"/>
               Live Earthquakes
               <span className="ml-auto font-mono text-xs text-slate-500">{filtered.length}</span>
             </h3>
 
-            {loading && Array.from({length:6}).map((_,i) => (
+            {loading && !quakes.length && Array.from({length:6}).map((_,i) => (
               <div key={i} className="skeleton h-20 rounded-xl"/>
             ))}
 
-            {!loading && filtered.map(q => (
+            {filtered.map(q => (
               <motion.div key={q.id}
                 onClick={() => setSelected(q.id===selected?.id ? null : q)}
                 whileHover={{ x:3 }}
                 className="p-4 rounded-xl cursor-pointer transition-all duration-200"
-                style={{ border:`1px solid ${selected?.id===q.id ? severityColor[q.severity]+'50' : 'rgba(255,255,255,0.05)'}`, background: selected?.id===q.id ? `${severityColor[q.severity]}08` : 'rgba(13,21,64,0.4)' }}
+                style={{
+                  border:`1px solid ${selected?.id===q.id ? severityColor[q.severity]+'50' : 'rgba(255,255,255,0.05)'}`,
+                  background: selected?.id===q.id ? `${severityColor[q.severity]}08` : 'rgba(13,21,64,0.4)'
+                }}
               >
                 <div className="flex items-start justify-between mb-1.5">
                   <div>
-                    <p className="font-display font-bold text-sm text-white">M{q.magnitude} Earthquake</p>
-                    <span className="font-mono text-[10px] capitalize" style={{ color:severityColor[q.severity] }}>{q.severity}</span>
+                    <p className="font-bold text-sm text-white">M{q.magnitude} Earthquake</p>
+                    <span className="font-mono text-[10px] uppercase tracking-wide" style={{ color:severityColor[q.severity] }}>{q.severity}</span>
                   </div>
-                  <span className="font-display font-black text-2xl" style={{ color:severityColor[q.severity], opacity:0.25 }}>{q.magnitude}</span>
+                  <span className="font-black text-2xl" style={{ color:severityColor[q.severity], opacity:0.25 }}>{q.magnitude}</span>
                 </div>
-                <p className="font-body text-xs text-slate-500 mb-1 flex items-center gap-1 truncate">
+                <p className="text-xs text-slate-500 mb-1 flex items-center gap-1 truncate">
                   <MapPin size={9}/> {q.location}
                 </p>
                 <div className="flex justify-between font-mono text-xs text-slate-600">
@@ -298,7 +407,7 @@ export default function LiveMap() {
               >
                 <div className="p-5">
                   <div className="flex items-center justify-between mb-4">
-                    <h4 className="font-display font-bold text-white">M{selected.magnitude} Details</h4>
+                    <h4 className="font-bold text-white">M{selected.magnitude} Details</h4>
                     <button onClick={() => setSelected(null)} className="text-slate-500 hover:text-white"><X size={16}/></button>
                   </div>
                   <div className="space-y-2 font-mono text-xs mb-4">
