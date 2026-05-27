@@ -22,7 +22,7 @@ const httpServer = http.createServer(app)
 // ── Socket.IO ──────────────────────────────────────────────────────────────
 const io = new Server(httpServer, {
   cors: {
-    origin: process.env.CLIENT_URL || 'http://localhost:5173',
+    origin: (origin, cb) => { if (!origin || origin.endsWith('.onrender.com') || origin === (process.env.CLIENT_URL || 'http://localhost:5173')) cb(null, true); else cb(new Error('CORS')); },
     methods: ['GET', 'POST'],
     credentials: true,
   },
@@ -33,7 +33,7 @@ app.set('io', io) // make io available in routes
 // ── Security Middleware ────────────────────────────────────────────────────
 app.use(helmet({ contentSecurityPolicy: false }))
 app.use(cors({
-  origin: process.env.CLIENT_URL || 'http://localhost:5173',
+  origin: (origin, cb) => { if (!origin || origin.endsWith('.onrender.com') || origin === (process.env.CLIENT_URL || 'http://localhost:5173')) cb(null, true); else cb(new Error('CORS')); },
   credentials: true,
 }))
 
